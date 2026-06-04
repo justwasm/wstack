@@ -9,7 +9,7 @@
 //
 //	Application (net.Conn)
 //	      ↓
-//	Userland TCP/IP stack (via wireguard/tun/netstack)
+//	Userland TCP/IP stack (gVisor, AllowExternalLoopbackTraffic)
 //	      ↓ raw IP packets
 //	WebSocket connection
 //	      ↓
@@ -36,20 +36,26 @@ import (
 	"net"
 	"net/netip"
 
-	"golang.zx2c4.com/wireguard/tun"
-	"golang.zx2c4.com/wireguard/tun/netstack"
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
+	gstack "gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"nhooyr.io/websocket"
 )
+
+const defaultNICID = tcpip.NICID(1)
 
 // Options configures a [Stack].
 type Options struct {
 	// LocalAddrs are the IP addresses assigned to the virtual network
 	// interface. If empty, defaults to [10.0.0.2].
 	LocalAddrs []netip.Addr
-
-	// DNS are the addresses of DNS servers available through the stack.
-	// If empty, no DNS resolution is performed through the stack.
-	DNS []netip.Addr
 
 	// MTU is the maximum transmission unit for the virtual interface.
 	// If 0, defaults to 1420.
@@ -63,8 +69,8 @@ type Options struct {
 // Stack is a userland TCP/IP network stack tunneled over a WebSocket
 // connection. It is safe for concurrent use.
 type Stack struct {
-	dev    tun.Device
-	tnet   *netstack.Net
+	gs     *gstack.Stack
+	ep     *channel.Endpoint
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -79,25 +85,68 @@ func New(ctx context.Context, wsURL string, opts Options) (*Stack, error) {
 		opts.LocalAddrs = []netip.Addr{netip.MustParseAddr("10.0.0.2")}
 	}
 
-	// Create a virtual TUN device backed by a userspace TCP/IP stack.
-	dev, tnet, err := netstack.CreateNetTUN(opts.LocalAddrs, opts.DNS, opts.MTU)
-	if err != nil {
-		return nil, fmt.Errorf("wstack: create netstack: %w", err)
+	// Build a gVisor userspace TCP/IP stack.
+	// AllowExternalLoopbackTraffic is required so that packets whose source
+	// or destination address is a loopback address (e.g. 127.0.0.1) are not
+	// silently dropped when they arrive on a non-loopback NIC.
+	gs := gstack.New(gstack.Options{
+		NetworkProtocols: []gstack.NetworkProtocolFactory{
+			ipv4.NewProtocolWithOptions(ipv4.Options{
+				AllowExternalLoopbackTraffic: true,
+			}),
+			ipv6.NewProtocol,
+		},
+		TransportProtocols: []gstack.TransportProtocolFactory{
+			tcp.NewProtocol,
+			udp.NewProtocol,
+		},
+		HandleLocal: true,
+	})
+
+	ep := channel.New(512, uint32(opts.MTU), "")
+	if err := gs.CreateNIC(defaultNICID, ep); err != nil {
+		return nil, fmt.Errorf("wstack: CreateNIC: %v", err)
 	}
+
+	// Assign each requested local address to the NIC.
+	for _, addr := range opts.LocalAddrs {
+		var proto tcpip.NetworkProtocolNumber
+		if addr.Is4() {
+			proto = ipv4.ProtocolNumber
+		} else {
+			proto = ipv6.ProtocolNumber
+		}
+		pa := tcpip.ProtocolAddress{
+			Protocol:          proto,
+			AddressWithPrefix: tcpip.AddrFromSlice(addr.AsSlice()).WithPrefix(),
+		}
+		if err := gs.AddProtocolAddress(defaultNICID, pa, gstack.AddressProperties{}); err != nil {
+			ep.Close()
+			gs.Close()
+			return nil, fmt.Errorf("wstack: AddProtocolAddress(%v): %v", addr, err)
+		}
+	}
+
+	// Default routes: send everything through this NIC.
+	gs.SetRouteTable([]tcpip.Route{
+		{Destination: header.IPv4EmptySubnet, NIC: defaultNICID},
+		{Destination: header.IPv6EmptySubnet, NIC: defaultNICID},
+	})
 
 	// Connect to the WebSocket proxy.
 	wsConn, _, err := websocket.Dial(ctx, wsURL, opts.DialOptions)
 	if err != nil {
-		dev.Close()
+		ep.Close()
+		gs.Close()
 		return nil, fmt.Errorf("wstack: dial websocket %s: %w", wsURL, err)
 	}
-	// Allow messages up to a generous size to accommodate large MTUs.
+	// Allow messages large enough to hold any IP packet up to opts.MTU.
 	wsConn.SetReadLimit(int64(opts.MTU+40) * 4)
 
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Stack{
-		dev:    dev,
-		tnet:   tnet,
+		gs:     gs,
+		ep:     ep,
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
@@ -106,89 +155,152 @@ func New(ctx context.Context, wsURL string, opts Options) (*Stack, error) {
 	return s, nil
 }
 
-// run manages the bidirectional bridge between the WebSocket and the TUN device.
-// It closes the done channel when both directions have stopped.
+// run manages the bidirectional bridge between the WebSocket and the gVisor
+// channel endpoint. It closes the done channel when both directions stop.
 func (s *Stack) run(ctx context.Context, wsConn *websocket.Conn) {
 	defer close(s.done)
 
-	errc := make(chan error, 2)
-	go func() { errc <- s.wsToTun(ctx, wsConn) }()
-	go func() { errc <- s.tunToWs(ctx, wsConn) }()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	// Wait for either direction to fail, then cancel both.
+	errc := make(chan error, 2)
+
+	// WebSocket → gVisor: inject inbound IP packets into the stack.
+	go func() {
+		defer cancel()
+		for {
+			_, data, err := wsConn.Read(ctx)
+			if err != nil {
+				errc <- err
+				return
+			}
+			if len(data) == 0 {
+				continue
+			}
+			var proto tcpip.NetworkProtocolNumber
+			switch data[0] >> 4 {
+			case 4:
+				proto = ipv4.ProtocolNumber
+			case 6:
+				proto = ipv6.ProtocolNumber
+			default:
+				continue
+			}
+			pkt := gstack.NewPacketBuffer(gstack.PacketBufferOptions{
+				Payload: buffer.MakeWithData(data),
+			})
+			s.ep.InjectInbound(proto, pkt)
+			pkt.DecRef()
+		}
+	}()
+
+	// gVisor → WebSocket: forward outbound IP packets to the proxy.
+	go func() {
+		defer cancel()
+		for {
+			pkt := s.ep.ReadContext(ctx)
+			if pkt == nil {
+				errc <- ctx.Err()
+				return
+			}
+			buf := pkt.ToBuffer()
+			data := buf.Flatten()
+			pkt.DecRef()
+			if err := wsConn.Write(ctx, websocket.MessageBinary, data); err != nil {
+				errc <- err
+				return
+			}
+		}
+	}()
+
 	<-errc
-	s.cancel()
 	wsConn.Close(websocket.StatusNormalClosure, "")
 	<-errc
 }
 
-// wsToTun reads raw IP packets from the WebSocket and writes them to the TUN
-// device so that the in-process TCP/IP stack can process them.
-func (s *Stack) wsToTun(ctx context.Context, wsConn *websocket.Conn) error {
-	for {
-		_, data, err := wsConn.Read(ctx)
-		if err != nil {
-			return err
-		}
-		if len(data) == 0 {
-			continue
-		}
-		if _, err := s.dev.Write([][]byte{data}, 0); err != nil {
-			return err
-		}
+// addrToFullAddr converts a netip.AddrPort to a tcpip.FullAddress.
+func addrToFullAddr(ap netip.AddrPort) (tcpip.FullAddress, tcpip.NetworkProtocolNumber) {
+	addr := ap.Addr()
+	fa := tcpip.FullAddress{
+		Port: ap.Port(),
 	}
-}
-
-// tunToWs reads outgoing IP packets produced by the in-process TCP/IP stack
-// and forwards them to the server over the WebSocket connection.
-func (s *Stack) tunToWs(ctx context.Context, wsConn *websocket.Conn) error {
-	mtu, err := s.dev.MTU()
-	if err != nil {
-		return fmt.Errorf("wstack: get MTU: %w", err)
+	var proto tcpip.NetworkProtocolNumber
+	if addr.Is4() {
+		a4 := addr.As4()
+		fa.Addr = tcpip.AddrFrom4(a4)
+		proto = ipv4.ProtocolNumber
+	} else {
+		a16 := addr.As16()
+		fa.Addr = tcpip.AddrFrom16(a16)
+		proto = ipv6.ProtocolNumber
 	}
-
-	bufs := [][]byte{make([]byte, mtu)}
-	sizes := []int{0}
-
-	for {
-		n, err := s.dev.Read(bufs, sizes, 0)
-		if err != nil {
-			return err
-		}
-		for i := 0; i < n; i++ {
-			if err := wsConn.Write(ctx, websocket.MessageBinary, bufs[0][:sizes[i]]); err != nil {
-				return err
-			}
-		}
-	}
+	return fa, proto
 }
 
 // Dial creates a network connection through the stack to the given address.
 // The network must be "tcp", "tcp4", "tcp6", "udp", "udp4", or "udp6".
 func (s *Stack) Dial(ctx context.Context, network, address string) (net.Conn, error) {
-	return s.tnet.DialContext(ctx, network, address)
+	switch network {
+	case "tcp", "tcp4", "tcp6":
+		tcpAddr, err := net.ResolveTCPAddr(network, address)
+		if err != nil {
+			return nil, err
+		}
+		ip, ok := netip.AddrFromSlice(tcpAddr.IP)
+		if !ok {
+			return nil, fmt.Errorf("wstack: invalid address %q", address)
+		}
+		fa, proto := addrToFullAddr(netip.AddrPortFrom(ip.Unmap(), uint16(tcpAddr.Port)))
+		return gonet.DialContextTCP(ctx, s.gs, fa, proto)
+	case "udp", "udp4", "udp6":
+		udpAddr, err := net.ResolveUDPAddr(network, address)
+		if err != nil {
+			return nil, err
+		}
+		ip, ok := netip.AddrFromSlice(udpAddr.IP)
+		if !ok {
+			return nil, fmt.Errorf("wstack: invalid address %q", address)
+		}
+		fa, proto := addrToFullAddr(netip.AddrPortFrom(ip.Unmap(), uint16(udpAddr.Port)))
+		return gonet.DialUDP(s.gs, nil, &fa, proto)
+	default:
+		return nil, fmt.Errorf("wstack: unsupported network %q", network)
+	}
 }
 
 // Listen announces on the local network address through the stack.
 // The network must be "tcp", "tcp4", or "tcp6".
 func (s *Stack) Listen(network, address string) (net.Listener, error) {
-	addr, err := net.ResolveTCPAddr(network, address)
+	tcpAddr, err := net.ResolveTCPAddr(network, address)
 	if err != nil {
 		return nil, err
 	}
-	return s.tnet.ListenTCP(addr)
+	var fa tcpip.FullAddress
+	var proto tcpip.NetworkProtocolNumber
+	if tcpAddr.IP == nil || tcpAddr.IP.IsUnspecified() {
+		fa = tcpip.FullAddress{Port: uint16(tcpAddr.Port)}
+		proto = ipv4.ProtocolNumber
+	} else {
+		ip, ok := netip.AddrFromSlice(tcpAddr.IP)
+		if !ok {
+			return nil, fmt.Errorf("wstack: invalid address %q", address)
+		}
+		fa, proto = addrToFullAddr(netip.AddrPortFrom(ip.Unmap(), uint16(tcpAddr.Port)))
+	}
+	return gonet.ListenTCP(s.gs, fa, proto)
 }
 
-// Net returns the underlying [netstack.Net], which provides additional
-// methods for creating TCP, UDP, and ICMP connections.
-func (s *Stack) Net() *netstack.Net {
-	return s.tnet
+// GStack returns the underlying gVisor [gstack.Stack], which provides
+// low-level access to the userspace TCP/IP stack.
+func (s *Stack) GStack() *gstack.Stack {
+	return s.gs
 }
 
 // Close shuts down the Stack and the underlying WebSocket connection.
 func (s *Stack) Close() error {
 	s.cancel()
-	err := s.dev.Close()
+	s.gs.Close()
+	s.ep.Close()
 	<-s.done
-	return err
+	return nil
 }
