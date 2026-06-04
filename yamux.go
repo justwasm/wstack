@@ -11,12 +11,12 @@ import (
 
 	"github.com/btwiuse/wsdial"
 	"github.com/hashicorp/yamux"
+	"golang.org/x/net/proxy"
 )
 
 // yamuxOverWSDialer lazily establishes a yamux session over a single
-// WebSocket connection and opens a lightweight stream per Dial call.
-// The remote side (Cloudflare Worker) demuxes streams and connects
-// each to its target address via raw TCP.
+// WebSocket connection and opens a bare stream per Dial call.
+// Target address negotiation is left to the caller (e.g. SOCKS5).
 type yamuxOverWSDialer struct {
 	mu      sync.RWMutex
 	session *yamux.Session
@@ -43,14 +43,12 @@ func (d *yamuxOverWSDialer) DialContext(ctx context.Context, network, addr strin
 		}
 	}
 
-	// Send target address as first data on the stream.
-	// The Worker reads this before forwarding any subsequent data.
-	if _, err := stream.Write([]byte(addr)); err != nil {
-		stream.Close()
-		return nil, fmt.Errorf("send target address: %w", err)
-	}
-
 	return stream, nil
+}
+
+// Dial implements proxy.Dialer — opens a bare yamux stream.
+func (d *yamuxOverWSDialer) Dial(network, addr string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, addr)
 }
 
 func (d *yamuxOverWSDialer) getSession(ctx context.Context) (*yamux.Session, error) {
@@ -103,8 +101,8 @@ func (d *yamuxOverWSDialer) reset() {
 
 // NewYamuxOverWSTransport creates an http.Transport that routes through
 // a Cloudflare Worker via a single yamux-over-WebSocket connection.
-// The Worker demuxes streams and connects each to the target address
-// via raw TCP.
+// Each yamux stream carries a SOCKS5 handshake so the relay knows the
+// target address — no custom framing needed.
 //
 //   - wsRelayHost: the Cloudflare Worker URL (e.g. "https://yamux-proxy.example.workers.dev")
 func NewYamuxOverWSTransport(wsRelayHost string) (*http.Transport, error) {
@@ -117,8 +115,22 @@ func NewYamuxOverWSTransport(wsRelayHost string) (*http.Transport, error) {
 		wsURL: wsURL,
 	}
 
+	// A dummy SOCKS5 proxy address is used here. The real address is ignored
+	// because our forward dialer opens yamux streams directly to the relay.
+	// Using a valid host:port prevents misleading error messages if a
+	// SOCKS5 handshake fails — the error would show the real target, not
+	// the relay URL.
+	socks5Dialer, err := proxy.SOCKS5("tcp", "0.0.0.0:0", nil, dialer)
+	if err != nil {
+		return nil, fmt.Errorf("create SOCKS5 dialer: %w", err)
+	}
+
+	ctxDialer := socks5Dialer.(proxy.ContextDialer)
+
 	return &http.Transport{
-		DialContext:     dialer.DialContext,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return ctxDialer.DialContext(ctx, network, addr)
+		},
 		TLSClientConfig: insecure,
 		MaxIdleConns:    100,
 		// Yamux streams have negligible setup cost, but we still want

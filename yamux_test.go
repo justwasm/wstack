@@ -1,14 +1,18 @@
+//go:build !js
+
 package wstack
 
 import (
 	"bufio"
 	"context"
+	"io"
 	"net/http"
 	"net/url"
 	"testing"
 	"time"
 
 	"github.com/coder/websocket"
+	"golang.org/x/net/proxy"
 )
 
 func TestYamuxWorkerSSE(t *testing.T) {
@@ -56,13 +60,20 @@ func TestYamuxWorkerWebSocket(t *testing.T) {
 		wsURL: wsURL,
 	}
 
+	socks5Dialer, err := proxy.SOCKS5("tcp", "0.0.0.0:0", nil, yamuxDialer)
+	if err != nil {
+		t.Fatalf("SOCKS5 dialer: %v", err)
+	}
+	ctxDialer := socks5Dialer.(proxy.ContextDialer)
+
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
 	conn, _, err := websocket.Dial(ctx, "wss://ws.postman-echo.com/raw", &websocket.DialOptions{
 		HTTPClient: &http.Client{
 			Transport: &http.Transport{
-				DialContext: yamuxDialer.DialContext,
+				DialContext:     ctxDialer.DialContext,
+				TLSClientConfig: insecure,
 			},
 		},
 	})
@@ -85,4 +96,31 @@ func TestYamuxWorkerWebSocket(t *testing.T) {
 		t.Fatalf("expected 'hello yamux', got '%s'", string(msg))
 	}
 	t.Logf("WebSocket echo OK: %s", string(msg))
+}
+
+func TestYamuxLocalSOCKS5(t *testing.T) {
+	transport, err := NewYamuxOverWSTransport("ws://127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("NewYamuxOverWSTransport: %v", err)
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   15 * time.Second,
+	}
+
+	// Requires a Bun yamux relay running locally:
+	//   cd piping-ssh-web && bun run proxy/yamux.ts
+	resp, err := client.Get("http://httpbin.org/get")
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200, got %s", resp.Status)
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	t.Logf("yamux local SOCKS5 OK: %s", string(body))
 }
