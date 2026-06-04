@@ -2,6 +2,7 @@ package wstack_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -93,7 +94,7 @@ func runTestProxy(ctx context.Context, wsConn *websocket.Conn) error {
 	ep := channel.New(512, mtu, "")
 
 	if err := s.CreateNIC(nicID, ep); err != nil {
-		return err.(error)
+		return fmt.Errorf("%v", err)
 	}
 	s.SetPromiscuousMode(nicID, true)  //nolint:errcheck
 	s.SetSpoofing(nicID, true)         //nolint:errcheck

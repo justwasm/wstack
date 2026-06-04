@@ -178,8 +178,8 @@ func runProxy(ctx context.Context, wsConn *websocket.Conn) error {
 		}
 
 		var wq waiter.Queue
-		inEP, tcpErr := req.CreateEndpoint(&wq)
-		if tcpErr != nil {
+		inEP, udpErr := req.CreateEndpoint(&wq)
+		if udpErr != nil {
 			return
 		}
 
